@@ -4,16 +4,27 @@ library(NHANES)
 library(corrplot)
 library(naniar)
 
-data(NHANES)
-df <- NHANES
+data(NHANESraw)
+df <- NHANESraw
 
 # 1. Initial data overview
 dim(df)          # size: 10000 rows, 76 variables
 head(df)         # first rows
 str(df)          # variable types
 
+# 1.1 Filter to adults
+df <- df %>% filter(Age >= 18)
+
 # 2. missing values
 colSums(is.na(df)) # number of missing values per column
+
+# number and percentage of missing values per column
+data.frame(
+  missing = colSums(is.na(df)),
+  pct = round(colMeans(is.na(df)) * 100, 1)
+) %>%
+  filter(missing > 0) %>%
+  arrange(desc(pct))
 
 # 3. distribution of key numerical variables
 # select the most important numerical variables

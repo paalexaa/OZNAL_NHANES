@@ -1,0 +1,709 @@
+---
+title: "NHANES"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(NHANES)
+library(nhanesA)
+library(corrplot)
+
+data(NHANESraw)
+df <- NHANESraw
+```
+
+# Hypotheses
+H1: Physically inactive adults over 45 with high BMI have significantly higher risk of diabetes.
+
+H2: People with lower physical activity, poorer sleep, and higher BMI are more likely to be depressed.
+
+
+# Target variable calculation (PHQ-9 score)
+
+https://pubmed.ncbi.nlm.nih.gov/11556941/
+
+The `Depressed` column in the NHANES R package contains only one PHQ-9 item (DPQ020). We reconstruct the full 9-item PHQ-9 score from the raw NHANES depression screener tables for cycles 2009–2010 (DPQ_F) and 2011–2012 (DPQ_G), which correspond to the years covered by `NHANESraw`.
+
+```{r phq9-load}
+dpq_f <- nhanes("DPQ_F")
+dpq_g <- nhanes("DPQ_G")
+```
+
+```{r phq9-recode}
+phq9_items <- paste0("DPQ0", c("10", "20", "30", "40", "50", "60", "70", "80", "90"))
+
+phq9_recode <- c(
+  "Not at all"             = 0,
+  "Several days"           = 1,
+  "More than half the days"= 2,
+  "Nearly every day"       = 3
+)
+
+dpq <- bind_rows(dpq_f, dpq_g) %>%
+  select(SEQN, all_of(phq9_items)) %>%
+  mutate(across(all_of(phq9_items), ~phq9_recode[as.character(.)]))
+```
+
+```{r}
+# check ID ranges overlap
+range(NHANESraw$ID)
+range(dpq$SEQN)
+
+nhanes_ids <- NHANESraw %>% filter(Age >= 18) %>% pull(ID)
+sum(nhanes_ids %in% dpq$SEQN)   # matched
+sum(!nhanes_ids %in% dpq$SEQN)  # in NHANESraw but not in dpq
+```
+
+PHQ-9 >= 10 indicates at least moderate depression.
+
+```{r phq9-score}
+dpq <- dpq %>%
+  mutate(
+    phq9_score = rowSums(across(all_of(phq9_items)), na.rm = FALSE),
+    depressed  = as.integer(phq9_score >= 10)
+  )
+```
+
+We merge the PHQ-9 scores and depression status into the main dataset using the participant ID (`SEQN` in `dpq` corresponds to `ID` in `NHANESraw`).
+
+```{r merge}
+df <- NHANESraw %>%
+  filter(Age >= 18) %>%
+  inner_join(dpq %>% select(SEQN, phq9_score, depressed), by = c("ID" = "SEQN"))
+
+head(df)
+```
+
+# EDA
+
+## Target variable: Depressed
+
+The target variable is `depressed`. PHQ-9 score >=10 is classified as depressed (1), <= 10 as not depressed (0).
+
+```{r target-count}
+df %>% count(depressed) %>% mutate(percent = round(n / sum(n) * 100))
+```
+
+About 13% of observations have a missing PHQ-9 score (participants who did not complete the questionnaire). These will be excluded.
+
+```{r}
+df <- df %>% filter(!is.na(depressed))
+```
+
+```{r target-plot}
+df %>%
+  count(depressed) %>%
+  mutate(pct = round(100 * n / sum(n), 1),
+         label = paste0(n, " (", pct, "%)"),
+         depressed = factor(depressed, labels = c("Not depressed (0)", "Depressed (1)"))) %>%
+  ggplot(aes(x = depressed, y = n)) +
+  geom_col() +
+  geom_text(aes(label = label), vjust = -0.4) +
+  labs(title = "Distribution of target `depressed`",
+       x = NULL, y = "Count")
+```
+
+The classes are heavily imbalanced: 91% not depressed vs 9% depressed. This is will require handling during modeling (stratified splits, class weighting, resampling).
+
+## Predictor selection
+
+```{r missing-values}
+data.frame(
+  missing = colSums(is.na(df)),
+  pct = round(colMeans(is.na(df)) * 100, 1)
+) %>%
+  filter(missing > 0) %>%
+  arrange(desc(pct))
+```
+
+
+We select potential predictors based on domain knowledge about depression risk factors and percentage of missing values. We immediately exclude:
+
+- `DepressionScreen` - number of days where participant felt down, depressed or hopeless. This is one of the PHQ-9 items used to compute the target score, so including it would be direct data leakage.
+- `LittleInterest` - this corresponds to DPQ020, one of the 9 PHQ-9 items used to compute the target score. Including it would be direct data leakage.
+- `DaysMentHlthBad` - self-reported number of poor mental health days, overlapping with the target.
+
+The selected predictors:
+
+```{r predictor-select}
+predictors <- c(
+  "Gender", "Age", "Race1", "Education", "MaritalStatus",
+  "HHIncomeMid", "Poverty", "Work", "HomeOwn",
+  "BMI", "DaysPhysHlthBad", "HealthGen", "Diabetes", "TotChol", "Pulse",
+  "SleepHrsNight", "SleepTrouble",
+  "PhysActive", "PhysActiveDays",
+  "Smoke100", "AlcoholYear", "HardDrugs"
+)
+
+df_model <- df %>% select(depressed, all_of(predictors))
+
+num_vars <- df_model %>% select(where(is.numeric), -depressed) %>% names()
+cat_vars <- df_model %>% select(where(is.factor)) %>% names()
+
+glimpse(df_model)
+```
+
+## Univariate EDA
+
+Before looking at relationships with the target, we examine each predictor individually to understand its distribution, skewness and identify issues.
+
+### Numeric predictors
+
+```{r eda-numeric}
+df_model %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Distribution of numeric predictors", x = NULL, y = "Count")
+```
+
+Key observations:
+
+- `AlcoholYear` and `DaysPhysHlthBad` are heavily right-skewed - most people report low values with a long tail. A log transformation may help for linear models.
+- `BMI` is right-skewed with some extreme values above 60 - outliers.
+- `Pulse` is roughly bell-shaped but has a suspicious spike near 150 bpm - likely outliers.
+- `SleepHrsNight` is discrete and roughly normal around 7 hours.
+- `PhysActiveDays` shows a roughly uniform spread from 1–7, since NAs (inactive people) are excluded here.
+- `Age`, `TotChol`, and `Poverty` look reasonably well-distributed.
+
+### Closer look at problematic numeric variables
+
+Some variables need more attention before preprocessing. We look at summary stats, outlier counts and zero-inflation.
+
+```{r eda-numeric-summary}
+df_model %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    min      = min(value, na.rm = TRUE),
+    median   = median(value, na.rm = TRUE),
+    mean     = round(mean(value, na.rm = TRUE), 1),
+    max      = max(value, na.rm = TRUE),
+    sd       = round(sd(value, na.rm = TRUE), 1),
+    pct_zero = round(100 * mean(value == 0, na.rm = TRUE), 1)
+  )
+```
+
+```{r eda-numeric-boxplots}
+df_model %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = "", y = value)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Boxplots of numeric predictors", x = NULL, y = NULL)
+```
+
+**Pulse** - 1 value below 40 bpm and 11 above 120 bpm. These are physiologically implausible as resting heart rates and should be treated as outliers.
+
+```{r eda-pulse}
+df_model %>%
+  summarise(below_40 = sum(Pulse < 40, na.rm = TRUE),
+            above_120 = sum(Pulse > 120, na.rm = TRUE))
+```
+
+**BMI** - 5 values below 15 and 27 above 60. Values this extreme are rare in a survey context and likely measurement errors or data entry issues.
+
+```{r eda-bmi}
+df_model %>%
+  summarise(below_15 = sum(BMI < 15, na.rm = TRUE),
+            above_60 = sum(BMI > 60, na.rm = TRUE))
+```
+
+**PhysActiveDays** - has one impossible value of 99 (scale is 1–7 days per week). We will remove this immediately.
+
+```{r eda-physactivedays}
+df_model %>%
+  filter(!is.na(PhysActiveDays)) %>%
+  count(PhysActiveDays > 7)
+
+df_model <- df_model %>% mutate(PhysActiveDays = ifelse(PhysActiveDays > 7, NA, PhysActiveDays))
+```
+
+**DaysPhysHlthBad and AlcoholYear** - both are heavily zero-inflated and right-skewed. `DaysPhysHlthBad` is 63.8% zeros, `AlcoholYear` has a long tail stretching to 364. A log1p transformation (`log(x + 1)`) will compress the skew while keeping zeros intact.
+
+```{r eda-zeroinflation}
+library(patchwork)
+
+p1 <- df_model %>%
+  filter(!is.na(DaysPhysHlthBad)) %>%
+  mutate(group = ifelse(DaysPhysHlthBad == 0, "Zero", "Non-zero")) %>%
+  count(group) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ggplot(aes(x = group, y = n)) +
+  geom_col() +
+  geom_text(aes(label = paste0(pct, "%")), vjust = -0.4) +
+  labs(title = "DaysPhysHlthBad", x = NULL, y = "Count")
+
+p2 <- df_model %>%
+  filter(!is.na(AlcoholYear), AlcoholYear > 0) %>%
+  ggplot(aes(x = AlcoholYear)) +
+  geom_histogram(bins = 40) +
+  labs(title = "AlcoholYear (non-zero only)", x = "Drinks per year", y = "Count")
+
+p1 + p2
+```
+
+**Summary of preprocessing implications from numeric EDA:**
+
+| Variable | Issue | Planned action |
+|---|---|---|
+| `Pulse` | Outliers (<40, >120) | Cap or remove |
+| `BMI` | Outliers (<15, >60) | Cap or remove |
+| `PhysActiveDays` | 1 impossible value (99) | Removed |
+| `DaysPhysHlthBad` | 63.8% zeros + right skew | log1p transform |
+| `AlcoholYear` | Right skew | log1p transform |
+
+### Categorical predictors
+
+```{r eda-categorical}
+df_model %>%
+  select(all_of(cat_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x = value)) +
+  geom_bar() +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Distribution of categorical predictors", x = "Count", y = NULL)
+```
+
+Key observations:
+
+- `Race1` is dominated by white participants. Other groups are smaller, which may affect model reliability for those subgroups.
+- `MaritalStatus` is mostly Married, less common categories (Separated, Widowed) have small counts and may be worth collapsing.
+- `HealthGen` and `Education` are reasonably spread across levels.
+- `Diabetes`, `SleepTrouble`, `HardDrugs` are imbalanced.
+- `Smoke100` shows that slightly more than half of adults have smoked 100+ cigarettes in their lifetime.
+
+### Closer look at categorical variables
+
+We examine three things: rare levels that may need collapsing, whether any NAs are encoded as factor levels, and whether ordinal variables are stored correctly.
+
+#### Rare levels
+
+```{r eda-cat-rare}
+df_model %>%
+  select(all_of(cat_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  mutate(total_nonmissing = sum(!is.na(value))) %>%
+  filter(!is.na(value)) %>%
+  count(variable, value, total_nonmissing) %>%
+  mutate(pct = round(100 * n / total_nonmissing, 1),
+         rare = pct < 5) %>%
+  arrange(variable, desc(n)) %>%
+  print(n = 60)
+```
+
+Four variables have rare levels (< 5% of non-missing responses):
+
+- `HealthGen`: "Poor" = 3.9% → merge with "Fair" into "Fair/Poor"
+- `HomeOwn`: "Other" = 2.8% → merge with "Rent" into "Not Own"
+- `MaritalStatus`: "Separated" = 3.5% → merge with "Divorced"
+- `Work`: "Looking" = 4.4% → merge with "NotWorking"
+
+#### NA as factor level
+
+```{r eda-cat-na-levels}
+df_model %>%
+  select(all_of(cat_vars)) %>%
+  summarise(across(everything(), ~any(levels(.) %in% c("NA", "Don't know")))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "has_explicit_NA_level")
+```
+
+No variables encode NA as an explicit factor level - all missing values are proper R `NA`s and will be handled uniformly in preprocessing.
+
+#### Ordinal variables
+
+```{r eda-cat-ordinal}
+cat("Education levels:", levels(df_model$Education), "\n")
+cat("HealthGen levels:", levels(df_model$HealthGen), "\n")
+cat("Education ordered:", is.ordered(df_model$Education), "\n")
+cat("HealthGen ordered:", is.ordered(df_model$HealthGen), "\n")
+```
+
+Both `Education` and `HealthGen` are naturally ordinal but stored as unordered factors. Their levels are already in the correct order (`Education`: 8th Grade → College Grad; `HealthGen` should go Poor → Excellent). Both should be converted to ordered factors in preprocessing - this matters for tree-based models and any model that encodes them numerically.
+
+**Summary of preprocessing implications from categorical EDA:**
+
+| Variable | Issue | Planned action |
+|---|---|---|
+| `HealthGen` | "Poor" is 3.9% (rare) + unordered | Merge with "Fair"; convert to ordered factor |
+| `HomeOwn` | "Other" is 2.8% (rare) | Merge with "Rent" → "Not Own" |
+| `MaritalStatus` | "Separated" is 3.5% (rare) | Merge with "Divorced" |
+| `Work` | "Looking" is 4.4% (rare) | Merge with "NotWorking" |
+| `Education` | Unordered despite being ordinal | Convert to ordered factor |
+
+## Bivariate EDA
+
+We now look at the relationship between each predictor and `depressed`. For numeric predictors we use point-biserial correlation (equivalent to Pearson with a binary outcome) and boxplots. For categorical predictors we look at the depression rate per category level.
+
+### Numeric predictors vs target
+
+```{r bivariate-numeric-cor}
+df_model %>%
+  select(depressed, all_of(num_vars)) %>%
+  pivot_longer(-depressed, names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(correlation = round(cor(value, depressed, use = "complete.obs"), 3)) %>%
+  arrange(desc(abs(correlation)))
+```
+
+```{r bivariate-numeric-boxplots}
+df_model %>%
+  select(depressed, all_of(num_vars)) %>%
+  mutate(depressed = factor(depressed, labels = c("Not depressed", "Depressed"))) %>%
+  pivot_longer(-depressed, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = depressed, y = value)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Numeric predictors by depression status", x = NULL, y = NULL)
+```
+
+The strongest associations with depression:
+
+- `DaysPhysHlthBad` (r = 0.280) - the strongest numeric predictor. Depressed participants report noticeably more bad physical health days.
+- `Poverty` (r = −0.165) and `HHIncomeMid` (r = −0.160) - both point in the same direction: lower income/higher poverty → higher depression. These two are also correlated with each other, which is worth keeping in mind.
+- `SleepHrsNight` (r = −0.119) - less sleep is associated with higher depression.
+- `Pulse` (r = 0.084) and `BMI` (r = 0.075) - modest associations.
+
+Weak relationships: `AlcoholYear` (r = −0.035), `TotChol` (r = 0.028), `Age` (r = −0.015), `PhysActiveDays` (r = −0.011). These variables show little separation between depressed and non-depressed groups and are candidates for dropping.
+
+### Categorical predictors vs target
+
+```{r bivariate-categorical}
+df_model %>%
+  select(depressed, all_of(cat_vars)) %>%
+  pivot_longer(-depressed, names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  group_by(variable, value) %>%
+  summarise(depression_rate = round(100 * mean(depressed), 1), n = n(), .groups = "drop") %>%
+  ggplot(aes(x = depression_rate, y = value)) +
+  geom_col() +
+  geom_text(aes(label = paste0(depression_rate, "%")), hjust = -0.1, size = 3) +
+  facet_wrap(~variable, scales = "free_y") +
+  xlim(0, 70) +
+  labs(title = "Depression rate by category", x = "% depressed", y = NULL)
+```
+
+The strongest categorical associations:
+
+- `HealthGen` - Poor (43.5%) down to Excellent (2.1%).
+- `SleepTrouble` - Yes: 20.7% vs No: 5.5%. 
+- `MaritalStatus` - Separated (21.6%) and Divorced (13.8%) are highest; Married has the lowest rate (6.0%).
+- `Work` - NotWorking (13.6%) vs Working (5.6%).
+- `Gender` - females (11.8%) are notably more depressed than males (6.6%).
+- `Education` - 9–11th Grade (14.1%) down to College Grad (4.0%).
+- `HardDrugs` - Yes: 15.5% vs No: 8.7%.
+
+Weaker associations: `Race1`, `HomeOwn`, `Smoke100` show differences but more modest ones.
+
+**Candidates to consider dropping**: `TotChol`, `AlcoholYear`, `PhysActiveDays`.
+
+## Multivariate EDA: inter-predictor correlations
+
+Before modeling, we check whether predictors are correlated with each other. We use Pearson correlation for numeric pairs and Cramér's V for categorical pairs.
+
+### Numeric predictors
+
+```{r multivariate-numeric}
+cor_matrix <- df_model %>%
+  select(all_of(num_vars)) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(2)
+
+cor_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "r") %>%
+  ggplot(aes(x = var1, y = var2, fill = r)) +
+  geom_tile() +
+  geom_text(aes(label = r), size = 3) +
+  scale_fill_gradient2(low = "#d6604d", mid = "white", high = "#4393c3",
+                       midpoint = 0, limits = c(-1, 1)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Pearson correlation - numeric predictors", x = NULL, y = NULL, fill = "r")
+```
+
+**`HHIncomeMid` and `Poverty` are correlated at r = 0.90** because they are measuring the same thing (household income). Keeping both would result in severe multicollinearity. One predictor should be dropped before modeling. `Poverty` has fewer missing values, higher correlation with the target and is more commonly used in research, so we will drop `HHIncomeMid`.
+
+All other numeric pairs have low correlations (r <= 0.14).
+
+### Categorical predictors
+
+```{r multivariate-categorical}
+cramers_v <- function(x, y) {
+  tbl <- table(x, y)
+  chi2 <- suppressWarnings(chisq.test(tbl)$statistic)
+  n <- sum(tbl)
+  k <- min(nrow(tbl), ncol(tbl))
+  sqrt(chi2 / (n * (k - 1)))
+}
+
+cat_data <- df_model %>% select(all_of(cat_vars))
+pairs <- expand.grid(var1 = cat_vars, var2 = cat_vars, stringsAsFactors = FALSE)
+pairs$v <- mapply(function(a, b) cramers_v(cat_data[[a]], cat_data[[b]]),
+                  pairs$var1, pairs$var2)
+
+pairs %>%
+  mutate(v = round(v, 2)) %>%
+  ggplot(aes(x = var1, y = var2, fill = v)) +
+  geom_tile() +
+  geom_text(aes(label = v), size = 3) +
+  scale_fill_gradient(low = "white", high = "#4393c3", limits = c(0, 1)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Cramér's V - categorical predictors", x = NULL, y = NULL, fill = "V")
+```
+
+The highest V values:
+
+- `HardDrugs` and `Smoke100` (V = 0.30) - both measure substance use history. They overlap but capture different behaviours, so we will keep both.
+- `Education` and `PhysActive` (V = 0.29) - higher education is associated with more physical activity, but they are not redundant.
+- `HealthGen` and `PhysActive` (V = 0.27), `HealthGen` and `Work` (V = 0.25), `HealthGen` and `Diabetes` (V = 0.25) - `HealthGen` is moderately associated with several health-related variables, which makes sense since it is a general self-rated health measure.
+
+All V values are below 0.35, so no categorical predictor pair is redundant enough to drop.
+
+**Action from multivariate EDA:** drop `HHIncomeMid` - it is near-duplicate of `Poverty` (r = 0.90).
+
+## Missing Values
+
+We examine missingness across the full dataset before splitting.
+
+```{r missing-eda}
+df_model %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = round(100 * n_missing / (nrow(df_model %>% filter(!is.na(depressed)))), 1)) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(pct_missing)) %>%
+  ggplot(aes(x = pct_missing, y = reorder(variable, pct_missing))) +
+  geom_col() +
+  geom_text(aes(label = paste0(pct_missing, "%")), hjust = -0.1, size = 3) +
+  xlim(0, 60) +
+  labs(title = "Missing values among modeling rows", x = "% missing", y = NULL)
+```
+
+Two variables need closer inspection before deciding on an imputation strategy.
+
+**`PhysActiveDays`** - 51.5% missing. This is a structural issue. NHANES only asks this question to participants who reported being physically active.
+
+```{r missing-physactivedays}
+df_model %>%
+  group_by(PhysActive) %>%
+  summarise(
+    n           = n(),
+    n_missing   = sum(is.na(PhysActiveDays)),
+    pct_missing = round(100 * n_missing / n, 1)
+  )
+```
+
+Every inactive participant (`PhysActive == "No"`) has a missing `PhysActiveDays` value, because the question was never asked. Inactive people have zero active days, so we will fill these with 0 rather than imputing from the distribution.
+
+**`HardDrugs`** - 17.7% missing. Missingness increases sharply with age, pointing to skip logic in the survey.
+
+```{r missing-harddrugs}
+df_model %>%
+  mutate(age_group = cut(Age, breaks = c(18, 30, 45, 60, 80), right = FALSE,
+                         labels = c("18–29", "30–44", "45–59", "60+"))) %>%
+  group_by(age_group) %>%
+  summarise(
+    n           = n(),
+    n_missing   = sum(is.na(HardDrugs)),
+    pct_missing = round(100 * n_missing / n, 1)
+  )
+```
+
+Participants aged 60+ were not asked the hard drug use question in NHANES. For these respondents we will impute with the mode ("No") as the most conservative default.
+
+**Imputation strategy summary:**
+
+| Variable | % missing | Type | Strategy |
+|---|---|---|---|
+| `PhysActiveDays` | 51.5% | Structural (skip logic) | Fill 0 for `PhysActive == "No"` |
+| `HardDrugs` | 17.7% | Structural for 60+, non-response for younger | Mode imputation |
+| `AlcoholYear` | 16.3% | Non-response | Median imputation |
+| `HHIncomeMid` | 9.7% | Non-response | **Drop** (redundant with `Poverty`) |
+| `Poverty` | 8.4% | Non-response | Median imputation |
+| `Education`, `MaritalStatus`, `TotChol`, `Smoke100` | ~5% | Non-response | Median / mode imputation |
+| `Pulse`, `BMI` | 1–2% | Non-response | Median imputation |
+| All others | < 0.5% | Non-response | Median / mode imputation |
+
+
+# Summary
+
+
+# Train / Test Split
+
+We split before any preprocessing to prevent data leakage - scaling, imputation and encoding will be fit on the training set only and applied to the test set. The split is stratified on `depressed` to preserve the 91/9 class ratio in both sets.
+
+```{r split}
+set.seed(38)
+
+df_split <- df_model %>%
+  mutate(depressed = factor(depressed, levels = c(0, 1), labels = c("no", "yes")))
+
+split <- initial_split(df_split, prop = 0.75, strata = depressed)
+train <- training(split)
+test  <- testing(split)
+
+cat("Training set:", nrow(train), "\n")
+cat("Test set:    ", nrow(test),  "\n")
+
+train %>% count(depressed) %>% mutate(pct = round(100 * n / sum(n), 1))
+test  %>% count(depressed) %>% mutate(pct = round(100 * n / sum(n), 1))
+```
+
+
+# Preprocessing
+
+All steps of preprocessing are encoded in a `tidymodels` recipe that is adapted into two variants: one with `step_normalize` (for Logistic Regression) and one without (for tree-based models).
+
+```{r recipe-setup}
+train_raw <- training(split)
+```
+
+```{r recipe-scaled}
+recipe_scaled <- recipe(depressed ~ ., data = train_raw) %>%
+  # Remove HHIncomeMid
+  step_rm(HHIncomeMid) %>%
+  # Structural NA: inactive participants have 0 active days
+  step_mutate(PhysActiveDays = ifelse(PhysActive == "No", 0, PhysActiveDays)) %>%
+  # Winsorize physiologically implausible values
+  step_mutate(
+    Pulse = pmin(pmax(Pulse, 40), 120),
+    BMI   = pmin(pmax(BMI,   15),  60)
+  ) %>%
+  # Impute remaining NAs
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  # Reduce right skew on zero-inflated variables
+  step_mutate(
+    DaysPhysHlthBad = log1p(DaysPhysHlthBad),
+    AlcoholYear     = log1p(AlcoholYear)
+  ) %>%
+  # Collapse rare factor levels (< 5%)
+  step_mutate(
+    HomeOwn       = fct_collapse(HomeOwn,   "Not Own"   = c("Rent", "Other")),
+    MaritalStatus = fct_collapse(MaritalStatus, "Divorced" = c("Divorced", "Separated")),
+    Work          = fct_collapse(Work,       "NotWorking" = c("NotWorking", "Looking"))
+  ) %>%
+  # Integer-encode ordinal variables (preserves rank without k-1 dummies)
+  step_mutate(
+    Education = as.integer(factor(Education,
+      levels = c("8th Grade", "9 - 11th Grade", "High School", "Some College", "College Grad"))),
+    HealthGen = as.integer(factor(HealthGen,
+      levels = c("Poor", "Fair", "Good", "Vgood", "Excellent")))
+  ) %>%
+  # Dummy-encode remaining nominal predictors
+  step_dummy(all_nominal_predictors()) %>%
+  # Normalize to mean 0, sd 1 - required for Logistic Regression
+  step_normalize(all_numeric_predictors())
+```
+
+The recipe for tree-based models is identical, except for the last step (`step_normalize`), which is omitted.
+
+## Before / After Visualizations
+
+To visualize the effect of preprocessing, we do a partial recipe (everything except dummy encoding and normalization), so distributions remain on their original scale.
+
+```{r recipe-viz-prep}
+recipe_viz <- recipe(depressed ~ ., data = train_raw) %>%
+  step_rm(HHIncomeMid) %>%
+  step_mutate(PhysActiveDays = ifelse(PhysActive == "No", 0, PhysActiveDays)) %>%
+  step_mutate(
+    Pulse = pmin(pmax(Pulse, 40), 120),
+    BMI   = pmin(pmax(BMI,   15),  60)
+  ) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_mutate(
+    DaysPhysHlthBad = log1p(DaysPhysHlthBad),
+    AlcoholYear     = log1p(AlcoholYear)
+  ) %>%
+  step_mutate(
+    HomeOwn       = fct_collapse(HomeOwn,   "Not Own"   = c("Rent", "Other")),
+    MaritalStatus = fct_collapse(MaritalStatus, "Divorced" = c("Divorced", "Separated")),
+    Work          = fct_collapse(Work,       "NotWorking" = c("NotWorking", "Looking"))
+  )
+
+train_viz <- recipe_viz %>% prep(training = train_raw) %>% bake(new_data = NULL)
+```
+
+### Numeric predictors
+
+The key changes visible in the "after" plot: `DaysPhysHlthBad` and `AlcoholYear` shift from heavily right-skewed to more symmetric distributions after log1p; `BMI` loses its extreme upper tail after winsorizing; `PhysActiveDays` now includes the inactive participants (filled as 0) and `HHIncomeMid` is dropped.
+
+```{r viz-numeric-before}
+train_raw %>%
+  select(where(is.numeric), -depressed) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Numeric predictors - before preprocessing", x = NULL, y = "Count")
+```
+
+```{r viz-numeric-after}
+train_viz %>%
+  select(where(is.numeric), -depressed) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Numeric predictors - after (log1p, winsorize, impute)", x = NULL, y = "Count")
+```
+
+Boxplots.
+
+```{r viz-numeric-boxplot-before}
+train_raw %>%
+  select(where(is.numeric), -depressed) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(y = value)) +
+  geom_boxplot(outlier.size = 0.8, outlier.alpha = 0.4) +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Numeric predictors - boxplots before preprocessing", y = NULL, x = NULL)
+```
+
+```{r viz-numeric-boxplot-after}
+train_viz %>%
+  select(where(is.numeric), -depressed) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(y = value)) +
+  geom_boxplot(outlier.size = 0.8, outlier.alpha = 0.4) +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Numeric predictors - boxplots after (log1p, winsorize, impute)", y = NULL, x = NULL)
+```
+
+### Categorical predictors
+
+The "after" plot shows the effect of level collapsing: `HomeOwn` has two levels ("Other" merged into "Not Own"), `MaritalStatus` loses "Separated" (merged into "Divorced"), and `Work` loses "Looking" (merged into "NotWorking"). All missing values have been imputed.
+
+```{r viz-cat-before}
+train_raw %>%
+  select(where(is.factor), -depressed) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(y = value)) +
+  geom_bar() +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Categorical predictors - before preprocessing", x = "Count", y = NULL)
+```
+
+```{r viz-cat-after}
+train_viz %>%
+  select(where(is.factor), -depressed) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(y = value)) +
+  geom_bar() +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Categorical predictors - after (collapsed levels, imputed)", x = "Count", y = NULL)
+```
+
